@@ -1,0 +1,26 @@
+{
+  "model": "gpt-5.2",
+  "max_items_per_feed": 10,
+  "feeds": [
+    {
+      "name": "Ondas - Google News",
+      "url": "https://news.google.com/rss/search?q=Ondas%20Holdings%20ONDS&hl=en-US&gl=US&ceid=US:en"
+    },
+    {
+      "name": "Micron - Google News",
+      "url": "https://news.google.com/rss/search?q=Micron%20Technology%20MU&hl=en-US&gl=US&ceid=US:en"
+    },
+    {
+      "name": "Ondas - SEC Filings (Atom)",
+      "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001646188&owner=exclude&count=40&output=atom"
+    },
+    {
+      "name": "Micron - SEC Filings (Atom)",
+      "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000723125&owner=exclude&count=40&output=atom"
+    },
+    {
+      "name": "Bloomberg Europe (via Google News)",
+      "url": "https://news.google.com/rss/search?q=site%3Abloomberg.com%20Europe&hl=en-GB&gl=GB&ceid=GB:en"
+    }
+  ]
+}
