@@ -105,6 +105,7 @@ def stable_id(feed_name: str, title: str, link: str) -> str:
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS items (
             id TEXT PRIMARY KEY,
@@ -119,6 +120,25 @@ def init_db() -> None:
             created_at TEXT
         )
     """)
+
+    # migrations légères (ajoute les colonnes si elles n'existent pas)
+    cols_to_add = [
+        ("priority", "TEXT"),
+        ("publication_freshness", "TEXT"),
+        ("market_bias", "TEXT"),
+        ("time_horizon", "TEXT"),
+        ("confidence_level", "TEXT"),
+        ("key_links", "TEXT"),  # JSON string
+        ("investor_takeaway", "TEXT"),
+    ]
+
+    cur.execute("PRAGMA table_info(items)")
+    existing = {row[1] for row in cur.fetchall()}
+
+    for col, typ in cols_to_add:
+        if col not in existing:
+            cur.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
+
     conn.commit()
     conn.close()
 
@@ -131,12 +151,17 @@ def save_item(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     cur = conn.cursor()
     cur.execute("""
         INSERT OR REPLACE INTO items
-        (id, feed_name, title, link, published, summary, ai_summary, sentiment, score, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, feed_name, title, link, published, summary, ai_summary, sentiment, score, created_at,
+         priority, publication_freshness, market_bias, time_horizon, confidence_level, key_links, investor_takeaway)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["id"], row["feed_name"], row["title"], row["link"],
         row.get("published"), row.get("summary"), row.get("ai_summary"),
-        row.get("sentiment"), row.get("score"), row.get("created_at")
+        row.get("sentiment"), row.get("score"), row.get("created_at"),
+        row.get("priority"), row.get("publication_freshness"), row.get("market_bias"),
+        row.get("time_horizon"), row.get("confidence_level"),
+        json.dumps(row.get("key_links", []), ensure_ascii=False),
+        row.get("investor_takeaway"),
     ))
     conn.commit()
 
@@ -171,27 +196,93 @@ def analyze_with_openai(client: OpenAI, item: Dict[str, Any]) -> Dict[str, Any]:
     - score: -2,-1,0,+1,+2 (impact marché)
     """
     prompt = f"""
-Tu es un expert analyste boursier. Donne un résultat concis en FRANÇAIS.
+Tu es un analyste macro-financier senior spécialisé en marchés financiers globaux
+(actions, indices, taux, matières premières, devises, crypto, ETF).
 
-CONTEXTE:
-Source: {item["feed_name"]}
-Titre: {item["title"]}
-Extrait: {item["summary"]}
-Lien: {item["link"]}
+OBJECTIF :
+Transformer l’actualité brute en un signal exploitable pour un investisseur,
+en tenant compte de la temporalité de l’information.
 
-TÂCHE:
-1) Résume en 10-15 phrases (FR).
-2) Classe l'impact potentiel "marché" pour l'actif concerné:
-   - sentiment: positive / negative / neutral
-   - score: -2, -1, 0, +1, +2
-3) Donne 2 points clés sous forme de puces.
-Réponds STRICTEMENT en JSON avec ces clés:
-{{
-  "ai_summary": "...",
+CONTEXTE DE L’ARTICLE :
+Source : {item["feed_name"]}
+Date de publication : {item["published"]}
+Titre : {item["title"]}
+Contenu / extrait : {item["summary"]}
+Lien : {item["link"]}
+
+INSTRUCTIONS CRITIQUES :
+
+1️⃣ ANALYSE TEMPORELLE (PRIORITAIRE)
+- Analyse la date de publication :
+  - information très récente (impact immédiat possible)
+  - information récente mais déjà partiellement intégrée par le marché
+  - information ancienne servant de confirmation ou de rappel
+- Évalue si le marché a probablement déjà “pricé” cette information ou non.
+
+2️⃣ ANALYSE CONTEXTUELLE
+- Interprète l’information dans un cadre macro-économique global.
+- Identifie si la news est :
+  - micro (entreprise spécifique)
+  - sectorielle
+  - macro (inflation, taux, géopolitique, liquidité, politique monétaire).
+- Détermine si cette info est :
+  - nouvelle
+  - une confirmation
+  - une contradiction d’une tendance existante.
+
+3️⃣ LIENS ENTRE ACTUALITÉS (RENFORCEMENT DE SIGNAL)
+- Mets cette information en relation avec :
+  - d’autres articles récents
+  - événements macro-économiques connus
+  - narratifs dominants de marché (risk-on / risk-off, taux, croissance).
+- Si plusieurs articles récents convergent vers la même conséquence,
+  considère cela comme un SIGNAL un plus ou moins RENFORCÉ (logique).
+
+4️⃣ IMPACT MARCHÉ
+- Évalue l’impact probable sur :
+  - sentiment global de marché
+  - actifs concernés (actions, indices, obligations, devises, matières premières).
+- Distingue clairement :
+  - impact immédiat (heures / jours)
+  - impact différé (semaines / mois).
+
+5️⃣ PRIORISATION (ESSENTIEL)
+Classe l’importance de cette information en tenant compte de :
+- sa date
+- sa nouveauté
+- sa capacité à modifier un narratif existant
+
+Niveaux :
+- critical : événement structurant ou catalyseur
+- high : information importante mais non décisive seule
+- medium : confirmation utile
+- low : bruit de marché ou info déjà intégrée
+
+6️⃣ SORTIE OBLIGATOIRE (FORMAT STRICT JSON)
+Réponds STRICTEMENT en JSON avec les champs suivants :
+
+{{ 
+  "priority": "critical|high|medium|low",
+  "publication_freshness": "très_récent|récent|ancien",
+  "ai_summary": "Analyse synthétique en français, orientée investisseur (10–15 phrases max)",
+  "market_bias": "bullish|bearish|neutral|volatile",
   "sentiment": "positive|negative|neutral",
   "score": -2|-1|0|1|2,
-  "bullets": ["...", "..."]
+  "time_horizon": "court_terme|moyen_terme|long_terme",
+  "confidence_level": "faible|modérée|élevée",
+  "key_links": [
+    "Lien logique avec d’autres événements ou articles récents",
+    "Confirmation ou contradiction d’un narratif macro"
+  ],
+  "investor_takeaway": "Pourquoi cette information compte réellement pour un investisseur aujourd’hui"
 }}
+
+RÈGLES :
+- Ton analyse doit être froide, factuelle et orientée décision.
+- Prends explicitement en compte la date de publication dans ton jugement.
+- Ne surestime pas une information ancienne sauf si elle renforce un signal récent.
+- Privilégie la convergence d’informations et la temporalité plutôt que l’article isolé.
+
 """.strip()
 
     resp = client.responses.create(
@@ -202,7 +293,7 @@ Réponds STRICTEMENT en JSON avec ces clés:
     text = resp.output_text.strip()
 
     # extraction JSON robuste
-    m = re.search(r"\{.*\}", text, flags=re.S)
+    m = re.search(r"\{[\s\S]*?\}", text)
     if not m:
         return {"ai_summary": text, "sentiment": "neutral", "score": 0, "bullets": []}
 
@@ -211,34 +302,65 @@ Réponds STRICTEMENT en JSON avec ces clés:
     except Exception:
         return {"ai_summary": text, "sentiment": "neutral", "score": 0, "bullets": []}
 
-    # normalisation
-    sentiment = str(data.get("sentiment", "neutral")).lower().strip()
+        # normalisation
+        def get_str(key, default=""):
+            v = data.get(key, default)
+            return norm_text(str(v)) if v is not None else default
+
+
+    priority = get_str("priority", "low").lower()
+    if priority not in ("critical", "high", "medium", "low"):
+        priority = "low"
+
+    publication_freshness = get_str("publication_freshness", "récent").lower()
+    # laisse flexible (tes valeurs peuvent être "très_récent|récent|ancien" ou variantes)
+
+    market_bias = get_str("market_bias", "neutral").lower()
+    sentiment = get_str("sentiment", "neutral").lower()
     if sentiment not in ("positive", "negative", "neutral"):
         sentiment = "neutral"
-    score = data.get("score", 0)
+
     try:
-        score = int(score)
+        score = int(data.get("score", 0))
     except Exception:
         score = 0
     if score not in (-2, -1, 0, 1, 2):
         score = 0
 
-    bullets = data.get("bullets", [])
-    if not isinstance(bullets, list):
-        bullets = []
+    time_horizon = get_str("time_horizon", "")
+    confidence_level = get_str("confidence_level", "")
+
+    key_links = data.get("key_links", [])
+    if not isinstance(key_links, list):
+        key_links = []
+    key_links = [norm_text(str(x)) for x in key_links][:3]
+
+    investor_takeaway = get_str("investor_takeaway", "")
+
+    ai_summary = get_str("ai_summary", "")
+    if not ai_summary:
+        ai_summary = text
 
     return {
-        "ai_summary": norm_text(data.get("ai_summary", "")) or text,
+        "priority": priority,
+        "publication_freshness": publication_freshness,
+        "ai_summary": ai_summary,
+        "market_bias": market_bias,
         "sentiment": sentiment,
         "score": score,
-        "bullets": bullets[:2],
+        "time_horizon": time_horizon,
+        "confidence_level": confidence_level,
+        "key_links": key_links,
+        "investor_takeaway": investor_takeaway,
     }
 
 def load_all_items() -> List[Dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, feed_name, title, link, published, summary, ai_summary, sentiment, score, created_at
+        SELECT id, feed_name, title, link, published, summary, ai_summary, sentiment, score, created_at, priority, publication_freshness, market_bias,
+        time_horizon, confidence_level, key_links, investor_takeaway
+
         FROM items
         ORDER BY created_at DESC
         LIMIT 200
@@ -249,17 +371,27 @@ def load_all_items() -> List[Dict[str, Any]]:
     out = []
     for r in rows:
         out.append({
-            "id": r[0],
-            "feed_name": r[1],
-            "title": r[2],
-            "link": r[3],
-            "published": r[4],
-            "summary": r[5],
-            "ai_summary": r[6],
-            "sentiment": r[7],
-            "score": r[8],
-            "created_at": r[9],
-        })
+    "id": r[0],
+    "feed_name": r[1],
+    "title": r[2],
+    "link": r[3],
+    "published": r[4],
+    "summary": r[5],
+    "ai_summary": r[6],
+    "sentiment": r[7],
+    "score": r[8],
+    "created_at": r[9],
+
+    # ✅ nouveaux champs
+    "priority": r[10],
+    "publication_freshness": r[11],
+    "market_bias": r[12],
+    "time_horizon": r[13],
+    "confidence_level": r[14],
+    "key_links": json.loads(r[15]) if r[15] else [],
+    "investor_takeaway": r[16],
+})
+
     return out
 
 def build_dashboard(items: List[Dict[str, Any]]) -> None:
@@ -299,6 +431,12 @@ def build_dashboard(items: List[Dict[str, Any]]) -> None:
       <div class="row">
         <span class="tag">{{ it.sentiment }} ({{ it.score }})</span>
         <span class="tag">{{ it.feed_name }}</span>
+        <span class="tag">prio: {{ it.priority }}</span>
+        <span class="tag">fresh: {{ it.publication_freshness }}</span>
+        {% if it.published %}
+        <span class="tag">pub: {{ it.published }}</span>
+        {% endif %}
+
         <span class="small">{{ it.created_at }}</span>
       </div>
       <h3 style="margin:10px 0 6px 0;">
@@ -364,15 +502,26 @@ def main() -> None:
                 analysis = analyze_with_openai(client, it)
             except Exception as e:
                 print(f"   ! Erreur OpenAI: {e}")
-                analysis = {"ai_summary": "", "sentiment": "neutral", "score": 0, "bullets": []}
+                analysis = {}
 
             row = {
                 **it,
+
                 "ai_summary": analysis.get("ai_summary", ""),
                 "sentiment": analysis.get("sentiment", "neutral"),
                 "score": analysis.get("score", 0),
+
+                "priority": analysis.get("priority", "low"),
+                "publication_freshness": analysis.get("publication_freshness", "ancien"),
+                "market_bias": analysis.get("market_bias", "neutral"),
+                "time_horizon": analysis.get("time_horizon", ""),
+                "confidence_level": analysis.get("confidence_level", ""),
+                "key_links": analysis.get("key_links", []),
+                "investor_takeaway": analysis.get("investor_takeaway", ""),
+
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
+
             save_item(conn, row)
             new_count += 1
 
