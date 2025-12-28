@@ -303,9 +303,9 @@ RÈGLES :
         return {"ai_summary": text, "sentiment": "neutral", "score": 0, "bullets": []}
 
         # normalisation
-        def get_str(key, default=""):
-            v = data.get(key, default)
-            return norm_text(str(v)) if v is not None else default
+    def get_str(key, default=""):
+        v = data.get(key, default)
+        return norm_text(str(v)) if v is not None else default
 
 
     priority = get_str("priority", "low").lower()
