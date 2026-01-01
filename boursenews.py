@@ -128,9 +128,11 @@ def init_db() -> None:
         ("market_bias", "TEXT"),
         ("time_horizon", "TEXT"),
         ("confidence_level", "TEXT"),
-        ("key_links", "TEXT"),  # JSON string
+        ("key_links", "TEXT"),          # JSON string
         ("investor_takeaway", "TEXT"),
-    ]
+        ("publisher", "TEXT"),
+        ("markets_impacted", "TEXT"),   # JSON string (liste)
+]
 
     cur.execute("PRAGMA table_info(items)")
     existing = {row[1] for row in cur.fetchall()}
@@ -152,8 +154,8 @@ def save_item(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     cur.execute("""
         INSERT OR REPLACE INTO items
         (id, feed_name, title, link, published, summary, ai_summary, sentiment, score, created_at,
-         priority, publication_freshness, market_bias, time_horizon, confidence_level, key_links, investor_takeaway)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         priority, publication_freshness, market_bias, time_horizon, confidence_level, key_links, investor_takeaway, publisher, markets_impacted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["id"], row["feed_name"], row["title"], row["link"],
         row.get("published"), row.get("summary"), row.get("ai_summary"),
@@ -161,7 +163,8 @@ def save_item(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
         row.get("priority"), row.get("publication_freshness"), row.get("market_bias"),
         row.get("time_horizon"), row.get("confidence_level"),
         json.dumps(row.get("key_links", []), ensure_ascii=False),
-        row.get("investor_takeaway"),
+        row.get("investor_takeaway"), row.get("publisher"),
+        json.dumps(row.get("markets_impacted", []), ensure_ascii=False),
     ))
     conn.commit()
 
@@ -270,6 +273,8 @@ Réponds STRICTEMENT en JSON avec les champs suivants :
   "score": -2|-1|0|1|2,
   "time_horizon": "court_terme|moyen_terme|long_terme",
   "confidence_level": "faible|modérée|élevée",
+  "publisher": "Nom court de l’éditeur (ex: Bloomberg, Reuters, FT...)",
+  "markets_impacted": ["Liste des marchés/actifs impactés (ex: Nasdaq 100, EU steel, USD, Oil, Bunds... en français)"],
   "key_links": [
     "Lien logique avec d’autres événements ou articles récents",
     "Confirmation ou contradiction d’un narratif macro"
@@ -339,7 +344,19 @@ RÈGLES :
 
     ai_summary = get_str("ai_summary", "")
     if not ai_summary:
-        ai_summary = text
+        ai_summary = investor_takeaway or item.get("summary", "")
+
+    publisher = get_str("publisher", "") or item.get("feed_name", "")
+
+    markets_impacted = data.get("markets_impacted", [])
+    if not isinstance(markets_impacted, list):
+        markets_impacted = []
+
+    markets_impacted = [
+        norm_text(str(x))
+        for x in markets_impacted
+        if str(x).strip()
+    ][:5]
 
     return {
         "priority": priority,
@@ -352,6 +369,8 @@ RÈGLES :
         "confidence_level": confidence_level,
         "key_links": key_links,
         "investor_takeaway": investor_takeaway,
+        "publisher": publisher,
+        "markets_impacted": markets_impacted,
     }
 
 def load_all_items() -> List[Dict[str, Any]]:
@@ -359,7 +378,7 @@ def load_all_items() -> List[Dict[str, Any]]:
     cur = conn.cursor()
     cur.execute("""
         SELECT id, feed_name, title, link, published, summary, ai_summary, sentiment, score, created_at, priority, publication_freshness, market_bias,
-        time_horizon, confidence_level, key_links, investor_takeaway
+        time_horizon, confidence_level, key_links, investor_takeaway, publisher, markets_impacted
 
         FROM items
         ORDER BY created_at DESC
@@ -390,6 +409,8 @@ def load_all_items() -> List[Dict[str, Any]]:
     "confidence_level": r[14],
     "key_links": json.loads(r[15]) if r[15] else [],
     "investor_takeaway": r[16],
+    "publisher": r[17] or "",
+    "markets_impacted": json.loads(r[18]) if r[18] else [],
 })
 
     return out
@@ -421,13 +442,72 @@ def build_dashboard(items: List[Dict[str, Any]]) -> None:
 <body>
   <h1>📈 BourseNews</h1>
   <div class="meta">Généré le {{ now }} — Modèle: {{ model }} — Items: {{ items|length }}</div>
+  <div class="controls" style="margin: 12px 0; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+  <label class="small">Tri :</label>
+  <select id="sortMode">
+    <option value="default">Par défaut</option>
+    <option value="score">Score (desc)</option>
+    <option value="score_x_priority">Score × Priority (desc)</option>
+  </select>
+
+  <button id="top10Today" type="button">Top 10 aujourd’hui</button>
+  <button id="resetView" type="button">Reset</button>
+
+  <span id="viewInfo" class="small" style="opacity:.85;"></span>
+</div>
+
+  <div id="filters" class="card" style="position:sticky; top:10px; z-index:20;">
+  <div class="row" style="gap:12px;">
+    <span class="tag">Filtres</span>
+
+    <label class="small">Tri</label>
+    <select id="sortBy" class="tag">
+      <option value="created_desc">Date (récent → ancien)</option>
+      <option value="priority_desc">Priorité (critical → low)</option>
+      <option value="score_desc">Score (haut → bas)</option>
+      <option value="publisher_asc">Éditeur (A → Z)</option>
+    </select>
+
+    <label class="small">Priorité</label>
+    <select id="priorityFilter" class="tag">
+      <option value="">Toutes</option>
+      <option value="critical">critical</option>
+      <option value="high">high</option>
+      <option value="medium">medium</option>
+      <option value="low">low</option>
+    </select>
+
+    <label class="small">Éditeur</label>
+    <select id="publisherFilter" class="tag">
+      <option value="">Tous</option>
+    </select>
+
+    <label class="small">Marché impacté</label>
+    <select id="marketFilter" class="tag">
+      <option value="">Tous</option>
+    </select>
+
+    <label class="small">Recherche</label>
+    <input id="q" class="tag" style="min-width:220px;" placeholder="mot-clé (titre/résumé)…" />
+
+    <button id="resetBtn" class="tag" type="button">Reset</button>
+
+    <span class="small" id="countInfo"></span>
+  </div>
+</div>
 
   {% for it in items %}
     {% set cls = "neu" %}
     {% if it.sentiment == "positive" %}{% set cls = "pos" %}{% endif %}
     {% if it.sentiment == "negative" %}{% set cls = "neg" %}{% endif %}
 
-    <div class="card {{ cls }}">
+<div class="card {{ cls }}"
+     data-priority="{{ it.priority }}"
+     data-score="{{ it.score if it.score is not none else 0 }}"
+     data-created-at="{{ it.created_at if it.created_at else '' }}"
+     data-publisher="{{ it.publisher if it.publisher else it.feed_name }}"
+     data-markets="{{ (it.markets_impacted | join(',')) if it.markets_impacted else '' }}">
+
       <div class="row">
         <span class="tag">{{ it.sentiment }} ({{ it.score }})</span>
         <span class="tag">{{ it.feed_name }}</span>
@@ -440,7 +520,8 @@ def build_dashboard(items: List[Dict[str, Any]]) -> None:
         <span class="small">{{ it.created_at }}</span>
       </div>
       <h3 style="margin:10px 0 6px 0;">
-        <a href="{{ it.link }}" target="_blank" rel="noopener">{{ it.title }}</a>
+        <a href="{{ it.link }}" target="_blank" rel="noopener">{{ it.title }}
+        {% if it.markets_impacted %} ({{ it.markets_impacted | join(', ') }}){% endif %}</a>
       </h3>
       <div class="small"><b>Résumé IA:</b> {{ it.ai_summary }}</div>
       {% if it.summary %}
@@ -448,6 +529,280 @@ def build_dashboard(items: List[Dict[str, Any]]) -> None:
       {% endif %}
     </div>
   {% endfor %}
+  <script>
+(function(){
+  // Ne prend que les vraies cartes articles (pas le bloc #filters)
+  const getCards = () =>
+    Array.from(document.querySelectorAll(".card"))
+      .filter(c => c.id !== "filters" && !c.closest("#filters"));
+
+  const sortBy = document.getElementById("sortBy");               // ton select "Tri" du bloc filtres
+  const sortMode = document.getElementById("sortMode");           // ton select "Tri" du haut (si tu le gardes)
+  const priorityFilter = document.getElementById("priorityFilter");
+  const publisherFilter = document.getElementById("publisherFilter");
+  const marketFilter = document.getElementById("marketFilter");
+  const q = document.getElementById("q");
+  const resetBtn = document.getElementById("resetBtn");
+  const countInfo = document.getElementById("countInfo");
+
+  const top10Btn = document.getElementById("top10Today");         // bouton "Top 10 aujourd’hui"
+  const resetViewBtn = document.getElementById("resetView");      // bouton reset du haut (si présent)
+  const viewInfo = document.getElementById("viewInfo");           // petit texte info (si présent)
+
+  // Priorité -> poids (accepte aussi strings type "critical"/"high"... ou nombres)
+  function priorityWeight(p) {
+    if (p === null || p === undefined) return 1;
+
+    // Numérique ("1","2","3","4")
+    const n = Number(p);
+    if (!Number.isNaN(n) && n > 0) return n;
+
+    const s = String(p).trim().toLowerCase();
+    if (s === "critical" || s === "prio: critical") return 4;
+    if (s === "high" || s === "prio: high" || s === "urgent") return 3;
+    if (s === "medium" || s === "med" || s === "prio: medium") return 2;
+    if (s === "low" || s === "prio: low") return 1;
+    return 1;
+  }
+
+  function parseScore(card){
+    const v = parseFloat(card.dataset.score || "0");
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  function parseCreatedAt(card){
+    const raw = card.dataset.createdAt || "";
+    const d = raw ? new Date(raw) : null;
+    return (d && !Number.isNaN(d.getTime())) ? d : null;
+  }
+
+  function sameLocalDay(a, b){
+    return a.getFullYear() === b.getFullYear()
+        && a.getMonth() === b.getMonth()
+        && a.getDate() === b.getDate();
+  }
+
+  // Sauvegarde ordre initial (pour "Par défaut")
+  const initialOrder = getCards().slice();
+
+  // Remplit les dropdowns (publisher/markets) depuis les cartes
+  const publishers = new Set();
+  const markets = new Set();
+  getCards().forEach(c => {
+    const p = (c.dataset.publisher || "").trim();
+    if (p) publishers.add(p);
+
+    const m = (c.dataset.markets || "")
+      .split(",").map(x => x.trim()).filter(Boolean);
+    m.forEach(x => markets.add(x));
+  });
+
+  if (publisherFilter){
+    Array.from(publishers).sort((a,b)=>a.localeCompare(b)).forEach(p => {
+      const opt = document.createElement("option");
+      opt.value = p;
+      opt.textContent = p;
+      publisherFilter.appendChild(opt);
+    });
+  }
+
+  if (marketFilter){
+    Array.from(markets).sort((a,b)=>a.localeCompare(b)).forEach(m => {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m;
+      marketFilter.appendChild(opt);
+    });
+  }
+
+  function renderInOrder(cards){
+    // Réinsère les cartes après le bloc filtres (ou après controls/meta si besoin)
+    const anchor =
+      document.querySelector("#filters") ||
+      document.querySelector(".controls") ||
+      document.querySelector(".meta");
+
+    cards.forEach(card => anchor.insertAdjacentElement("afterend", card));
+  }
+
+  function setViewInfo(txt){
+    if (viewInfo) viewInfo.textContent = txt || "";
+  }
+
+  function applySort(){
+    // Source du mode de tri :
+    // - priorité au select du haut (sortMode) si présent
+    // - sinon on utilise sortBy (bloc filtres)
+    const mode = (sortMode && sortMode.value) ? sortMode.value : (sortBy ? sortBy.value : "created_desc");
+
+    // "Par défaut"
+    if (mode === "default"){
+      renderInOrder(initialOrder);
+      setViewInfo("");
+      return;
+    }
+
+    const cards = getCards();
+
+    cards.sort((a,b) => {
+      // Dates
+      if (mode === "created_desc"){
+        const da = parseCreatedAt(a);
+        const db = parseCreatedAt(b);
+        return (db ? db.getTime() : 0) - (da ? da.getTime() : 0);
+      }
+
+      // Priorité
+      if (mode === "priority_desc"){
+        const pa = priorityWeight(a.dataset.priority);
+        const pb = priorityWeight(b.dataset.priority);
+        return pb - pa;
+      }
+
+      // Score
+      if (mode === "score"){
+        return parseScore(b) - parseScore(a);
+      }
+
+      // Score × Priority
+      if (mode === "score_x_priority"){
+        const sa = parseScore(a);
+        const sb = parseScore(b);
+        const pa = priorityWeight(a.dataset.priority);
+        const pb = priorityWeight(b.dataset.priority);
+        return (sb * pb) - (sa * pa);
+      }
+
+      return 0;
+    });
+
+    renderInOrder(cards);
+
+    if (mode === "score") setViewInfo("Tri: Score (desc)");
+    if (mode === "score_x_priority") setViewInfo("Tri: Score × Priority (desc)");
+  }
+
+  function applyFilters(){
+    const cards = getCards();
+
+    const prio = priorityFilter ? (priorityFilter.value || "") : "";
+    const pub = publisherFilter ? (publisherFilter.value || "") : "";
+    const mar = marketFilter ? (marketFilter.value || "") : "";
+    const needle = q ? (q.value || "").trim().toLowerCase() : "";
+
+    let shown = 0;
+
+    cards.forEach(c => {
+      let ok = true;
+
+      if (prio){
+        ok = ok && (String(c.dataset.priority || "").toLowerCase() === prio.toLowerCase());
+      }
+
+      if (pub){
+        ok = ok && ((c.dataset.publisher || "").trim() === pub);
+      }
+
+      if (mar){
+        const mm = (c.dataset.markets || "")
+          .split(",").map(x => x.trim());
+        ok = ok && mm.includes(mar);
+      }
+
+      if (needle){
+        const text = (c.textContent || "").toLowerCase();
+        ok = ok && text.includes(needle);
+      }
+
+      c.style.display = ok ? "" : "none";
+      if (ok) shown += 1;
+    });
+
+    if (countInfo) countInfo.textContent = `${shown} / ${cards.length}`;
+  }
+
+  function refresh(){
+    applySort();
+    applyFilters();
+  }
+
+  // --- Top 10 aujourd’hui (Score×Priority) ---
+  function showTop10Today(){
+    const cards = getCards();
+    const now = new Date();
+
+    const today = cards.filter(c => {
+      const d = parseCreatedAt(c);
+      return d ? sameLocalDay(d, now) : false;
+    });
+
+    today.sort((a,b) => {
+      const sa = parseScore(a);
+      const sb = parseScore(b);
+      const pa = priorityWeight(a.dataset.priority);
+      const pb = priorityWeight(b.dataset.priority);
+      return (sb * pb) - (sa * pa);
+    });
+
+    const top10 = today.slice(0, 10);
+
+    // Affiche seulement le top10, cache le reste
+    cards.forEach(c => c.style.display = "none");
+    top10.forEach(c => c.style.display = "");
+
+    // Réordonne pour afficher top10 au-dessus
+    renderInOrder(top10);
+
+    setViewInfo(`Top 10 aujourd’hui (${top10.length}) — Score×Priority`);
+    if (countInfo) countInfo.textContent = `${top10.length} / ${cards.length}`;
+  }
+
+  // Events
+  if (sortBy) sortBy.addEventListener("change", refresh);
+  if (sortMode) sortMode.addEventListener("change", refresh);
+
+  if (priorityFilter) priorityFilter.addEventListener("change", refresh);
+  if (publisherFilter) publisherFilter.addEventListener("change", refresh);
+  if (marketFilter) marketFilter.addEventListener("change", refresh);
+  if (q) q.addEventListener("input", () => applyFilters());
+
+  if (resetBtn){
+    resetBtn.addEventListener("click", () => {
+      if (sortBy) sortBy.value = "created_desc";
+      if (priorityFilter) priorityFilter.value = "";
+      if (publisherFilter) publisherFilter.value = "";
+      if (marketFilter) marketFilter.value = "";
+      if (q) q.value = "";
+      // Réaffiche tout
+      getCards().forEach(c => c.style.display = "");
+      refresh();
+      setViewInfo("");
+    });
+  }
+
+  if (top10Btn){
+    top10Btn.addEventListener("click", () => {
+      // Optionnel : remet le mode tri en "default" pour éviter un double tri
+      if (sortMode) sortMode.value = "default";
+      showTop10Today();
+    });
+  }
+
+  if (resetViewBtn){
+    resetViewBtn.addEventListener("click", () => {
+      if (sortMode) sortMode.value = "default";
+      // Réaffiche tout + ordre initial
+      getCards().forEach(c => c.style.display = "");
+      renderInOrder(initialOrder);
+      refresh();
+      setViewInfo("");
+    });
+  }
+
+  // init
+  refresh();
+})();
+</script>
 </body>
 </html>
 """.strip())
@@ -520,6 +875,8 @@ def main() -> None:
                 "investor_takeaway": analysis.get("investor_takeaway", ""),
 
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "publisher": analysis.get("publisher", it["feed_name"]),
+                "markets_impacted": analysis.get("markets_impacted", []),
             }
 
             save_item(conn, row)
